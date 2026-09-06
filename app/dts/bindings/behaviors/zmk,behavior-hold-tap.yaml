@@ -49,3 +49,7 @@ properties:
     default: []
   hold-trigger-on-release:
     type: boolean
+  grace-period-ms:
+    type: int
+    required: false
+    default: 0
