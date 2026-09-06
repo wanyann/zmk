@@ -48,6 +48,7 @@ enum decision_moment {
     HT_KEY_UP,
     HT_OTHER_KEY_DOWN,
     HT_OTHER_KEY_UP,
+    HT_OTHER_KEY_UP_GRACE,
     HT_TIMER_EVENT,
     HT_QUICK_TAP,
     HT_GRACE_EXPIRED,
@@ -296,6 +297,9 @@ static void decide_balanced(struct active_hold_tap *hold_tap, enum decision_mome
     case HT_OTHER_KEY_UP:
         hold_tap->status = STATUS_HOLD_INTERRUPT;
         return;
+    case HT_OTHER_KEY_UP_GRACE:
+        hold_tap->status = STATUS_HOLD_INTERRUPT;
+        return;
     case HT_TIMER_EVENT:
         hold_tap->status = STATUS_HOLD_TIMER;
         return;
@@ -403,6 +407,8 @@ static inline const char *decision_moment_str(enum decision_moment decision_mome
         return "other-key-down";
     case HT_OTHER_KEY_UP:
         return "other-key-up";
+    case HT_OTHER_KEY_UP_GRACE:
+        return "grace-hold";
     case HT_QUICK_TAP:
         return "quick-tap";
     case HT_TIMER_EVENT:
@@ -788,6 +794,8 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
 
     update_hold_status_for_retro_tap(ev->position);
 
+    bool grace_hold = false;
+
     if (undecided_hold_tap == NULL) {
         LOG_DBG("%d bubble (no undecided hold_tap active)", ev->position);
         return ZMK_EV_EVENT_BUBBLE;
@@ -828,7 +836,9 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
         if (!ev->state && ev->position == undecided_hold_tap->position_of_first_other_key_pressed) {
             // The held trigger key was released within the window: fall through
             // to the normal capture path so the other-key-up decision moment
-            // fires below and resolves us to a hold.
+            // fires below and resolves us to a hold. Mark it so the log shows
+            // "grace-hold" instead of the plain "other-key-up".
+            grace_hold = true;
         } else {
             // Any other event during the grace window is ignored entirely.
             LOG_DBG("%d ignoring %s for position %d during grace window",
@@ -864,7 +874,11 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
         .data = {.position = copy_raised_zmk_position_state_changed(ev)},
     };
     capture_event(&capture);
-    decide_hold_tap(undecided_hold_tap, ev->state ? HT_OTHER_KEY_DOWN : HT_OTHER_KEY_UP);
+    enum decision_moment dm = ev->state ? HT_OTHER_KEY_DOWN : HT_OTHER_KEY_UP;
+    if (grace_hold) {
+        dm = HT_OTHER_KEY_UP_GRACE;
+    }
+    decide_hold_tap(undecided_hold_tap, dm);
     return ZMK_EV_EVENT_CAPTURED;
 }
 
