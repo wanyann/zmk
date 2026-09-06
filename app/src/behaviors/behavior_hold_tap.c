@@ -50,6 +50,7 @@ enum decision_moment {
     HT_OTHER_KEY_UP,
     HT_TIMER_EVENT,
     HT_QUICK_TAP,
+    HT_GRACE_EXPIRED,
 };
 
 struct behavior_hold_tap_config {
@@ -63,6 +64,7 @@ struct behavior_hold_tap_config {
     bool hold_while_undecided_linger;
     bool retro_tap;
     bool hold_trigger_on_release;
+    int32_t grace_period_ms;
     int32_t hold_trigger_key_positions_len;
     int32_t hold_trigger_key_positions[];
 };
@@ -89,6 +91,10 @@ struct active_hold_tap {
 
     // initialized to -1, which is to be interpreted as "no other key has been pressed yet"
     int32_t position_of_first_other_key_pressed;
+
+    // true while the balanced grace window is open (own key released, waiting
+    // to see whether a held trigger key is released quickly enough for a hold)
+    bool grace_pending;
 };
 
 // The undecided hold tap is the hold tap that needs to be decided before
@@ -269,6 +275,7 @@ static struct active_hold_tap *store_hold_tap(struct zmk_behavior_binding_event 
         active_hold_taps[i].param_tap = param_tap;
         active_hold_taps[i].timestamp = event->timestamp;
         active_hold_taps[i].position_of_first_other_key_pressed = -1;
+        active_hold_taps[i].grace_pending = false;
         return &active_hold_taps[i];
     }
     return NULL;
@@ -278,6 +285,7 @@ static void clear_hold_tap(struct active_hold_tap *hold_tap) {
     hold_tap->position = ZMK_BHV_HOLD_TAP_POSITION_NOT_USED;
     hold_tap->status = STATUS_UNDECIDED;
     hold_tap->work_is_cancelled = false;
+    hold_tap->grace_pending = false;
 }
 
 static void decide_balanced(struct active_hold_tap *hold_tap, enum decision_moment event) {
@@ -292,6 +300,9 @@ static void decide_balanced(struct active_hold_tap *hold_tap, enum decision_mome
         hold_tap->status = STATUS_HOLD_TIMER;
         return;
     case HT_QUICK_TAP:
+        hold_tap->status = STATUS_TAP;
+        return;
+    case HT_GRACE_EXPIRED:
         hold_tap->status = STATUS_TAP;
         return;
     default:
@@ -396,6 +407,8 @@ static inline const char *decision_moment_str(enum decision_moment decision_mome
         return "quick-tap";
     case HT_TIMER_EVENT:
         return "timer";
+    case HT_GRACE_EXPIRED:
+        return "grace-expired";
     default:
         return "UNKNOWN STATUS";
     }
@@ -542,6 +555,20 @@ static void decide_hold_tap(struct active_hold_tap *hold_tap,
         return;
     }
 
+    // Balanced grace: on own key-up while a hold-trigger key is still held,
+    // defer the tap decision to a short window after the release. If the other
+    // key is released within the window, its key-up resolves us to a hold;
+    // otherwise the grace timer forces the tap.
+    if (decision_moment == HT_KEY_UP && hold_tap->config->grace_period_ms > 0 &&
+        hold_tap->config->flavor == FLAVOR_BALANCED &&
+        hold_tap->position_of_first_other_key_pressed != -1 &&
+        is_first_other_key_pressed_trigger_key(hold_tap)) {
+        hold_tap->grace_pending = true;
+        LOG_DBG("%d grace window %dms started", hold_tap->position,
+                hold_tap->config->grace_period_ms);
+        return;
+    }
+
     // If the hold-tap behavior is still undecided, attempt to decide it.
     switch (hold_tap->config->flavor) {
     case FLAVOR_HOLD_PREFERRED:
@@ -572,6 +599,17 @@ static void decide_hold_tap(struct active_hold_tap *hold_tap,
     undecided_hold_tap = NULL;
     press_binding(hold_tap);
     release_captured_events();
+
+    if (hold_tap->grace_pending) {
+        // Deferred resolution that finished the grace window: our own key is
+        // already physically up, so complete the press with the matching
+        // release (hold/tap) and free the slot. This runs for both a hold
+        // resolved by the other key's release and a tap forced by expiry.
+        k_work_cancel_delayable(&hold_tap->work);
+        hold_tap->grace_pending = false;
+        release_binding(hold_tap);
+        clear_hold_tap(hold_tap);
+    }
 }
 
 static void decide_retro_tap(struct active_hold_tap *hold_tap) {
@@ -656,6 +694,23 @@ static int on_hold_tap_binding_released(struct zmk_behavior_binding *binding,
     }
 
     decide_hold_tap(hold_tap, HT_KEY_UP);
+
+    if (hold_tap->grace_pending) {
+        // Balanced grace window is open: keep the undecided hold-tap live so
+        // the other key's release can still resolve us to a hold, and let the
+        // grace timer force the tap if nothing releases in time. Skip the
+        // normal release/cleanup here; the resolution path finishes it.
+        if (work_cancel_result == 0) {
+            k_work_schedule(&hold_tap->work, K_MSEC(hold_tap->config->grace_period_ms));
+            LOG_DBG("%d hold-tap released, awaiting grace window %dms", hold_tap->position,
+                    hold_tap->config->grace_period_ms);
+            return;
+        }
+        // The tapping-term timer callback is already queued; fall through to
+        // the normal immediate resolution in this corner case.
+        hold_tap->grace_pending = false;
+    }
+
     decide_retro_tap(hold_tap);
     release_binding(hold_tap);
 
@@ -837,11 +892,22 @@ void behavior_hold_tap_timer_work_handler(struct k_work *item) {
     struct k_work_delayable *d_work = k_work_delayable_from_work(item);
     struct active_hold_tap *hold_tap = CONTAINER_OF(d_work, struct active_hold_tap, work);
 
+    if (hold_tap->grace_pending) {
+        decide_hold_tap(hold_tap, HT_GRACE_EXPIRED);
+        return;
+    }
+
     if (hold_tap->work_is_cancelled) {
         clear_hold_tap(hold_tap);
-    } else {
-        decide_hold_tap(hold_tap, HT_TIMER_EVENT);
+        return;
     }
+
+    // Stale callback for a slot that was already cleared.
+    if (hold_tap->position == ZMK_BHV_HOLD_TAP_POSITION_NOT_USED) {
+        return;
+    }
+
+    decide_hold_tap(hold_tap, HT_TIMER_EVENT);
 }
 
 static int behavior_hold_tap_init(const struct device *dev) {
@@ -871,6 +937,7 @@ static int behavior_hold_tap_init(const struct device *dev) {
         .hold_while_undecided_linger = DT_INST_PROP(n, hold_while_undecided_linger),               \
         .retro_tap = DT_INST_PROP(n, retro_tap),                                                   \
         .hold_trigger_on_release = DT_INST_PROP(n, hold_trigger_on_release),                       \
+        .grace_period_ms = DT_INST_PROP(n, grace_period_ms),                                       \
         .hold_trigger_key_positions = DT_INST_PROP(n, hold_trigger_key_positions),                 \
         .hold_trigger_key_positions_len = DT_INST_PROP_LEN(n, hold_trigger_key_positions),         \
     };                                                                                             \
