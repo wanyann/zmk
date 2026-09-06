@@ -561,6 +561,7 @@ static void decide_hold_tap(struct active_hold_tap *hold_tap,
     // otherwise the grace timer forces the tap.
     if (decision_moment == HT_KEY_UP && hold_tap->config->grace_period_ms > 0 &&
         hold_tap->config->flavor == FLAVOR_BALANCED &&
+        hold_tap->status == STATUS_UNDECIDED &&
         hold_tap->position_of_first_other_key_pressed != -1 &&
         is_first_other_key_pressed_trigger_key(hold_tap)) {
         hold_tap->grace_pending = true;
