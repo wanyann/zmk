@@ -839,10 +839,24 @@ static int position_state_changed_listener(const zmk_event_t *eh) {
             // fires below and resolves us to a hold. Mark it so the log shows
             // "grace-hold" instead of the plain "other-key-up".
             grace_hold = true;
+        } else if (ev->state) {
+            // A different key is being pressed while the grace window is open.
+            // We must not keep a hold modifier (e.g. shift) latched while
+            // another key (possibly a mod-morph) is now typing, otherwise two
+            // layers/paths fight over the same modifier and the workqueue can
+            // hang. Resolve this hold-tap back to its stock balanced behaviour
+            // (tap) and release it before the other key prints.
+            LOG_DBG("%d closing grace window on press of %d", undecided_hold_tap->position,
+                    ev->position);
+            decide_hold_tap(undecided_hold_tap, HT_GRACE_EXPIRED);
+            if (undecided_hold_tap == NULL) {
+                return ZMK_EV_EVENT_BUBBLE;
+            }
+            return ZMK_EV_EVENT_BUBBLE;
         } else {
-            // Any other event during the grace window is ignored entirely.
-            LOG_DBG("%d ignoring %s for position %d during grace window",
-                    undecided_hold_tap->position, ev->state ? "press" : "release", ev->position);
+            // Any other release event during the grace window is ignored.
+            LOG_DBG("%d ignoring release for position %d during grace window",
+                    undecided_hold_tap->position, ev->position);
             return ZMK_EV_EVENT_BUBBLE;
         }
     }
